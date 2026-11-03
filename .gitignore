@@ -1,0 +1,11 @@
+# Contient la clé API : ne jamais publier
+config.json
+last_model.txt
+
+# Fichiers générés par PyInstaller
+build/
+dist/
+*.spec
+*.exe
+
+__pycache__/
