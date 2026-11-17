@@ -154,9 +154,18 @@ def add_turn(history, question, answer, image_png=None):
     history.append({"role": "model", "parts": [{"text": answer}]})
 
 
-def _generate(question, api_key, model, timeout, image_png=None, history=None, context=None):
+def build_body(question, image_png=None, history=None, context=None, instructions=None):
+    """Corps JSON complet de la requête (sous forme de dict)."""
+    body = {"contents": build_contents(question, image_png, history, context)}
+    if instructions:
+        # Consignes « système » : appliquées à toute la discussion, sans faire partie des messages.
+        body["systemInstruction"] = {"parts": [{"text": instructions}]}
+    return body
+
+
+def _generate(question, api_key, model, timeout, image_png=None, history=None, context=None, instructions=None):
     """Envoie une requête à UN modèle précis et renvoie le texte de sa réponse."""
-    body = json.dumps({"contents": build_contents(question, image_png, history, context)}).encode("utf-8")
+    body = json.dumps(build_body(question, image_png, history, context, instructions)).encode("utf-8")
     req = urllib.request.Request(
         API_URL.format(model=model),
         data=body,  # avec un corps, urllib envoie une requête POST
@@ -174,12 +183,14 @@ def _http_message(e):
         return e.reason
 
 
-def ask(question, api_key, model, timeout=20, image_png=None, preferred=None, history=None, context=None):
+def ask(question, api_key, model, timeout=20, image_png=None, preferred=None, history=None, context=None,
+        instructions=None):
     """Renvoie (réponse, modèle utilisé).
 
     image_png : capture optionnelle (octets PNG). preferred : modèle à essayer en premier en mode auto.
     history : échanges précédents (voir add_turn), pour garder le fil de la discussion.
     context : fichiers / textes de contexte (parts) joints à la question.
+    instructions : consignes permanentes (langue, ton…) choisies dans les paramètres.
     """
     global _working_model  # on va modifier la variable du module, pas en créer une locale
     if not api_key:
@@ -208,7 +219,8 @@ def ask(question, api_key, model, timeout=20, image_png=None, preferred=None, hi
     last = None  # dernière erreur rencontrée, affichée si tous échouent
     for name in candidates:
         try:
-            text = _generate(question, api_key, name, timeout, image_png, history=history, context=context)
+            text = _generate(question, api_key, name, timeout, image_png, history=history, context=context,
+                             instructions=instructions)
             _working_model = name
             return text, name
         except urllib.error.HTTPError as e:

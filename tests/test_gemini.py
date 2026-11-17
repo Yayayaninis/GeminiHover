@@ -106,7 +106,7 @@ class FallbackTest(unittest.TestCase):
         import urllib.error
         from unittest import mock
 
-        def fake_generate(q, key, name, timeout, image_png=None, history=None, context=None):
+        def fake_generate(q, key, name, timeout, image_png=None, history=None, context=None, instructions=None):
             if name == "gemini-3.6-flash":
                 raise urllib.error.HTTPError("u", 503, "busy", {}, io.BytesIO(b"{}"))
             return "ok"
@@ -121,7 +121,7 @@ class TimeoutFallbackTest(unittest.TestCase):
     def test_skips_model_that_times_out(self):
         from unittest import mock
 
-        def fake_generate(q, key, name, timeout, image_png=None, history=None, context=None):
+        def fake_generate(q, key, name, timeout, image_png=None, history=None, context=None, instructions=None):
             if name == "gemini-3.6-flash":
                 raise TimeoutError("The read operation timed out")
             return "ok"
@@ -138,7 +138,7 @@ class PreferredModelTest(unittest.TestCase):
         from unittest import mock
         tried = []
 
-        def fake_generate(q, key, name, timeout, image_png=None, history=None, context=None):
+        def fake_generate(q, key, name, timeout, image_png=None, history=None, context=None, instructions=None):
             tried.append(name)
             return "ok"
 

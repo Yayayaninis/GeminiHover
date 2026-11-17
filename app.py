@@ -1,9 +1,7 @@
 import ctypes
 import io
-import json
 import os
 import queue
-import sys
 import threading
 import time
 import tkinter as tk
@@ -14,40 +12,24 @@ import pystray
 from PIL import Image, ImageDraw, ImageGrab, ImageStat
 
 import gemini
+import settings
 
 HOTKEY_ID = 1
-MOD_ALT, MOD_CONTROL, MOD_NOREPEAT = 0x1, 0x2, 0x4000
-VK_G = 0x47
+MOD_NOREPEAT = 0x4000  # n'envoie pas l'événement en boucle si on garde les touches enfoncées
 WM_HOTKEY = 0x0312
+WM_APP_REHOTKEY = 0x8001  # message interne : « réenregistre le raccourci » (après les paramètres)
 KEYEVENTF_KEYUP = 0x2
-VK_CONTROL, VK_MENU, VK_SHIFT, VK_C = 0x11, 0x12, 0x10, 0x43
-MAX_LINES = 22
+VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN, VK_C = 0x11, 0x12, 0x10, 0x5B, 0x5C, 0x43
 MAX_IMAGE_SIDE = 2048
-POPUP_ALPHA = 0.5  # opacité de la popup : 1 = opaque, 0 = invisible
-AROUND = 150  # marge (pixels) autour de la popup dont on prend la couleur moyenne
 IMAGE_PROMPT = "Réponds à la question visible sur cette capture d'écran."
 
 user32 = ctypes.windll.user32
 shell32 = ctypes.windll.shell32
-
-
-def app_dir():
-    base = sys.executable if getattr(sys, "frozen", False) else __file__
-    return os.path.dirname(os.path.abspath(base))
-
-
-def load_config():
-    cfg = {"api_key": "", "model": "auto"}
-    path = os.path.join(app_dir(), "config.json")
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
-            cfg.update(json.load(f))
-    cfg["api_key"] = cfg["api_key"] or os.environ.get("GEMINI_API_KEY", "")
-    return cfg
+kernel32 = ctypes.windll.kernel32
 
 
 def last_model_path():
-    return os.path.join(app_dir(), "last_model.txt")
+    return os.path.join(settings.app_dir(), "last_model.txt")
 
 
 def load_last_model():
@@ -148,9 +130,8 @@ def screen_colors(area=None, exclude=None):
         r, g, b = average_color(shot, exclude)
     except Exception:
         r, g, b = 255, 255, 255
-    dark = 0.299 * r + 0.587 * g + 0.114 * b < 140
     bg = f"#{r:02x}{g:02x}{b:02x}"
-    return bg, ("#f1f3f4" if dark else "#202124"), ("#8ab4f8" if dark else "#4285f4")
+    return (bg, *settings.readable_text(bg))
 
 
 def clipboard_image_png():
@@ -208,7 +189,7 @@ def key(vk, up=False):
 
 
 def send_copy():
-    for vk in (VK_MENU, VK_SHIFT, VK_CONTROL):  # relâche le raccourci avant d'envoyer Ctrl+C
+    for vk in (VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN, VK_CONTROL):  # relâche le raccourci avant Ctrl+C
         key(vk, up=True)
     time.sleep(0.05)
     key(VK_CONTROL)
@@ -220,9 +201,11 @@ def send_copy():
 
 class App:
     def __init__(self):
-        self.cfg = load_config()
+        self.cfg = settings.load_config()
         self.events = queue.Queue()
-        self.answer = "Aucune question pour l'instant.\nSélectionne du texte puis Ctrl+Alt+G."
+        self.answer = f"Aucune question pour l'instant.\nSélectionne du texte puis {self.cfg['hotkey']}."
+        self.settings_win = None  # fenêtre de paramètres ouverte, s'il y en a une
+        self.hotkey_thread = None  # identifiant Windows du thread qui écoute le raccourci
         self.question = ""
         self.root = tk.Tk()
         self.root.withdraw()
@@ -251,6 +234,7 @@ class App:
                     pystray.MenuItem("Voir le contexte", lambda: self.events.put(("show_context",))),
                     pystray.MenuItem("Vider le contexte", lambda: self.events.put(("clear_context",))),
                 )),
+                pystray.MenuItem("Paramètres…", lambda: self.events.put(("settings",))),
                 pystray.MenuItem("Quitter", lambda: self.events.put(("quit",))),
             ),
         )
@@ -260,7 +244,6 @@ class App:
         p = tk.Toplevel(self.root)
         p.withdraw()
         p.overrideredirect(True)
-        p.attributes("-alpha", POPUP_ALPHA)  # fenêtre semi-transparente
         p.configure(highlightthickness=1)
         header = tk.Frame(p)
         header.pack(fill="x")
@@ -272,22 +255,35 @@ class App:
         body = tk.Frame(p)
         body.pack(fill="both", expand=True, padx=(10, 2), pady=(0, 8))
         self.popup_scroll = tk.Scrollbar(body)
-        self.popup_body = tk.Text(body, font=("Segoe UI", 10), wrap="word", width=60, height=4,
+        self.popup_body = tk.Text(body, wrap="word", height=4,
                                   relief="flat", borderwidth=0, highlightthickness=0, padx=0, pady=2,
                                   yscrollcommand=self.popup_scroll.set, cursor="arrow")
         self.popup_scroll.config(command=self.popup_body.yview)
         self.popup_body.pack(side="left", fill="both", expand=True)
         self.popup_widgets = (p, header, body, self.popup_title, close, self.popup_body)
         self.popup = p
+        self.apply_popup_settings()
+
+    def apply_popup_settings(self):
+        """Applique à la popup les réglages d'apparence (opacité, taille du texte, largeur)."""
+        c = self.cfg
+        self.popup.attributes("-alpha", c["opacity"])  # 1 = opaque, plus petit = plus transparent
+        self.popup_body.config(font=("Segoe UI", c["font_size"]), width=c["width"])
+        self.popup_title.config(font=("Segoe UI", max(c["font_size"] - 2, 7)))
 
     def apply_colors(self, rect):
-        """Colore la popup avec la couleur moyenne de la zone autour de rect (sa future position)."""
-        x0, y0, x1, y1 = rect
-        area = (x0 - AROUND, y0 - AROUND, x1 + AROUND, y1 + AROUND)
-        # Popup déjà affichée : ses propres pixels ne doivent pas compter. Sinon on garde aussi
-        # ce qui est sous elle, puisque c'est ce qu'on verra à travers la transparence.
-        exclude = self.popup_rect() if self.popup_visible() else None
-        bg, fg, border = screen_colors(area, exclude)
+        """Colore la popup : couleur fixe, ou couleur moyenne de la zone autour de rect (sa future position)."""
+        if self.cfg["color_mode"] == "fixed":
+            bg = self.cfg["fixed_color"]
+            fg, border = settings.readable_text(bg)
+        else:
+            m = self.cfg["around"]
+            x0, y0, x1, y1 = rect
+            area = (x0 - m, y0 - m, x1 + m, y1 + m)
+            # Popup déjà affichée : ses propres pixels ne doivent pas compter. Sinon on garde aussi
+            # ce qui est sous elle, puisque c'est ce qu'on verra à travers la transparence.
+            exclude = self.popup_rect() if self.popup_visible() else None
+            bg, fg, border = screen_colors(area, exclude)
         for w in self.popup_widgets:
             w.configure(bg=bg)
         for w in self.popup_widgets[3:]:
@@ -304,8 +300,9 @@ class App:
         # Hauteur adaptée au texte, plafonnée ; au-delà, barre de défilement.
         b.update_idletasks()
         lines = b.count("1.0", "end", "displaylines")[0] or 1
-        b.config(height=min(lines, MAX_LINES), state="disabled")  # lecture seule mais sélectionnable
-        if lines > MAX_LINES:
+        max_lines = self.cfg["max_lines"]
+        b.config(height=min(lines, max_lines), state="disabled")  # lecture seule mais sélectionnable
+        if lines > max_lines:
             self.popup_scroll.pack(side="right", fill="y")
         else:
             self.popup_scroll.pack_forget()
@@ -360,14 +357,51 @@ class App:
             else:
                 self.events.put(("hover", False))
 
-    def hotkey_loop(self):
-        if not user32.RegisterHotKey(None, HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_G):
-            self.events.put(("error", "Raccourci Ctrl+Alt+G déjà utilisé par une autre application."))
+    def register_hotkey(self):
+        """Enregistre le raccourci des paramètres. Doit tourner dans le thread hotkey_loop :
+        Windows envoie les WM_HOTKEY au thread qui a enregistré le raccourci."""
+        user32.UnregisterHotKey(None, HOTKEY_ID)  # sans effet si rien n'était enregistré
+        name = self.cfg["hotkey"]
+        try:
+            mods, vk = settings.parse_hotkey(name)
+        except ValueError as e:
+            self.events.put(("error", f"Raccourci invalide « {name} » : {e}"))
             return
+        if not user32.RegisterHotKey(None, HOTKEY_ID, mods | MOD_NOREPEAT, vk):
+            self.events.put(("error", f"Raccourci {name} déjà utilisé par une autre application. "
+                                      "Choisis-en un autre dans Paramètres."))
+
+    def hotkey_loop(self):
+        self.hotkey_thread = kernel32.GetCurrentThreadId()
+        self.register_hotkey()
         msg = wintypes.MSG()
+        # Boucle de messages Windows de ce thread : raccourci pressé, ou demande de réenregistrement.
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             if msg.message == WM_HOTKEY:
                 self.events.put(("hotkey",))
+            elif msg.message == WM_APP_REHOTKEY:
+                self.register_hotkey()
+
+    # --- paramètres --------------------------------------------------------
+    def open_settings(self):
+        if self.settings_win and self.settings_win.win.winfo_exists():
+            self.settings_win.win.lift()  # déjà ouverte : on la ramène devant
+            self.settings_win.win.focus_force()
+            return
+        self.settings_win = settings.SettingsWindow(self.root, dict(self.cfg), self.apply_settings)
+
+    def apply_settings(self, cfg):
+        """Appelé quand on clique sur Enregistrer dans les paramètres."""
+        old_hotkey = self.cfg["hotkey"]
+        self.cfg = cfg
+        if not cfg["api_key"]:  # même règle qu'au démarrage
+            cfg["api_key"] = os.environ.get("GEMINI_API_KEY", "")
+        self.apply_popup_settings()
+        if cfg["hotkey"] != old_hotkey and self.hotkey_thread:
+            # Le raccourci appartient au thread hotkey_loop : on lui demande de le changer.
+            user32.PostThreadMessageW(self.hotkey_thread, WM_APP_REHOTKEY, 0, 0)
+        if self.popup_visible():
+            self.show_popup()  # redessine avec les nouveaux réglages
 
     def query(self, text, image_png=None, label=None):
         self.question = label or text
@@ -376,13 +410,15 @@ class App:
 
         # Copie : le contexte peut changer pendant que la requête tourne en arrière-plan.
         context = [part for _name, part in self.context]
+        cfg = self.cfg  # idem pour les paramètres
+        timeout = max(cfg["timeout"], 60) if context else cfg["timeout"]  # un gros PDF demande plus de temps
 
         def work():
             try:
                 answer, self.model_used = gemini.ask(
-                    text, self.cfg["api_key"], self.cfg["model"], image_png=image_png,
+                    text, cfg["api_key"], cfg["model"], image_png=image_png,
                     preferred=load_last_model(), history=self.history, context=context,
-                    timeout=60 if context else 20)  # un gros PDF demande plus de temps
+                    timeout=timeout, instructions=cfg["instructions"])
                 gemini.add_turn(self.history, text, answer, image_png)
                 self.answer = answer
                 save_last_model(self.model_used)
@@ -478,7 +514,7 @@ class App:
                 elif kind == "new_chat":
                     self.history.clear()
                     self.question = ""
-                    self.answer = "Nouvelle discussion. Sélectionne du texte puis Ctrl+Alt+G."
+                    self.answer = f"Nouvelle discussion. Sélectionne du texte puis {self.cfg['hotkey']}."
                     self.show_popup(sticky=True)
                 elif kind == "reopen":
                     self.show_popup(sticky=True)
@@ -512,6 +548,8 @@ class App:
                 elif kind == "clear_context":
                     self.context.clear()
                     self.show_context("Contexte vidé.")
+                elif kind == "settings":
+                    self.open_settings()
                 elif kind == "error":
                     self.answer = f"⚠ {ev[1]}"
                 elif kind == "quit":

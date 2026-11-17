@@ -47,8 +47,8 @@ messages the conversation contains.
 - It appears at the bottom of the screen, near the mouse. It comes to the front once, then behaves like a normal
   window that other windows can cover.
 - Long answers can be scrolled; the text can be selected and copied.
-- It is slightly transparent, and its background takes the average color of the area around it
-  (150 px on each side), with light or dark text to stay readable.
+- It is semi-transparent, and its background takes the average color of the area around it
+  (150 px on each side by default), with light or dark text to stay readable. Both can be changed in *Paramètres*.
 - The title shows the model used, the number of messages in the conversation and the number of context items.
 - Errors (missing key, no network, quota reached, blocked answer…) are shown in the popup, prefixed with ⚠.
 
@@ -59,6 +59,24 @@ recent stable versions first, then *flash-lite*, then previews. If a model is ov
 unavailable or does not answer in time, the next one is tried automatically. The model that worked last is
 tried first the next time, even after a restart.
 
+### Settings panel
+
+*Paramètres…* in the tray menu opens a window with two tabs. Changes apply as soon as you click
+**Enregistrer** (no restart needed) and are saved in `config.json`. **Valeurs par défaut** resets every field
+except the API key.
+
+| Tab       | Setting                 | Description |
+|-----------|-------------------------|-------------|
+| Gemini    | Clé API                 | Your API key (hidden; tick *Afficher* to see it). |
+| Gemini    | Modèle                  | `auto`, or a model picked from the list (*Actualiser la liste* fetches the models available for your key). |
+| Gemini    | Délai de réponse        | Seconds to wait for an answer (at least 60 when context is present). |
+| Gemini    | Raccourci               | Global shortcut, e.g. `Ctrl+Alt+G` or `Ctrl+Shift+F2` (Ctrl, Alt, Shift, Win + a letter, digit or F1–F12). |
+| Gemini    | Instructions permanentes | Instructions applied to every answer, e.g. "Réponds en français, en 3 phrases maximum." |
+| Fenêtre   | Opacité                 | From 20 % (very transparent) to 100 % (opaque). |
+| Fenêtre   | Fond                    | Color of the area around the popup, or a fixed color of your choice. |
+| Fenêtre   | Zone analysée           | Size in pixels of the area around the popup used for the automatic color. |
+| Fenêtre   | Taille du texte, Largeur, Hauteur max | Font size, width in characters, and number of lines before scrolling. |
+
 ### Tray menu summary
 
 | Menu item                     | Action |
@@ -68,6 +86,7 @@ tried first the next time, even after a restart.
 | *Poser une question*          | Type a question |
 | *Envoyer le presse-papier*    | Send the clipboard (image or text) |
 | *Contexte*                    | Add files or text, view or clear the context |
+| *Paramètres…*                 | Open the settings panel |
 | *Quitter*                     | Quit the app |
 
 ## Getting a Gemini API key
@@ -81,7 +100,11 @@ If it leaks, delete it in AI Studio and create a new one.
 
 ## Configuration
 
-Next to `GeminiHover.exe`, create a file named `config.json` (you can copy `config.example.json`):
+The easiest way is the **settings panel** (*Paramètres…*): paste your API key and click *Enregistrer*.
+It creates `config.json` next to `GeminiHover.exe`.
+
+You can also write `config.json` by hand (you can copy `config.example.json`). Only `api_key` is required;
+missing fields use the defaults below.
 
 ```json
 {
@@ -90,10 +113,20 @@ Next to `GeminiHover.exe`, create a file named `config.json` (you can copy `conf
 }
 ```
 
-| Field     | Description |
-|-----------|-------------|
-| `api_key` | Your Gemini API key. If empty, the `GEMINI_API_KEY` environment variable is used instead. |
-| `model`   | `auto` (recommended) to pick an available flash model automatically, or an exact model name such as `gemini-3.5-flash-lite`. |
+| Field          | Default      | Description |
+|----------------|--------------|-------------|
+| `api_key`      | `""`         | Your Gemini API key. If empty, the `GEMINI_API_KEY` environment variable is used instead. |
+| `model`        | `auto`       | `auto` (recommended) to pick an available flash model automatically, or an exact model name such as `gemini-3.5-flash-lite`. |
+| `timeout`      | `20`         | Seconds to wait for an answer. |
+| `instructions` | `""`         | Permanent instructions sent to Gemini with every question. |
+| `hotkey`       | `Ctrl+Alt+G` | Global shortcut. |
+| `opacity`      | `0.5`        | Popup opacity, from `0.2` to `1`. |
+| `color_mode`   | `auto`       | `auto` (color of the area around the popup) or `fixed`. |
+| `fixed_color`  | `#202124`    | Background color used when `color_mode` is `fixed`. |
+| `around`       | `150`        | Pixels around the popup used for the automatic color. |
+| `font_size`    | `10`         | Popup text size. |
+| `width`        | `60`         | Popup width, in characters. |
+| `max_lines`    | `22`         | Lines shown before a scroll bar appears. |
 
 The app also creates `last_model.txt` next to the exe to remember which model worked last.
 Delete it to let `auto` try the newest models first again.
@@ -106,8 +139,8 @@ setx GEMINI_API_KEY "YOUR_GEMINI_API_KEY"
 
 ## Troubleshooting
 
-- **"Raccourci Ctrl+Alt+G déjà utilisé"**: another application already uses this shortcut. Close it, or use
-  the tray menu (*Poser une question*, *Envoyer le presse-papier*) instead.
+- **"Raccourci … déjà utilisé"**: another application already uses this shortcut. Pick another one in
+  *Paramètres*, or use the tray menu (*Poser une question*, *Envoyer le presse-papier*) instead.
 - **"Clé API absente"**: `config.json` is missing, is not next to the exe, or has an empty `api_key`.
 - **Nothing is sent when pressing `Ctrl+Alt+G`**: some apps block simulated copying. Copy manually with
   `Ctrl+C`, then use *Envoyer le presse-papier*.
@@ -118,7 +151,8 @@ setx GEMINI_API_KEY "YOUR_GEMINI_API_KEY"
 |------------------------|------|
 | `app.py`               | Tray icon, global shortcut, popup, dialogs and context management (Tkinter + pystray). |
 | `gemini.py`            | Gemini API calls: model ranking and fallback, conversation history, context files. Standard library only. |
-| `tests/`               | Unit tests for `gemini.py` and the popup color detection. |
+| `settings.py`          | Default settings, reading and writing `config.json`, shortcut parsing and the settings window. |
+| `tests/`               | Unit tests for `gemini.py`, `settings.py` and the popup color detection. |
 | `config.example.json`  | Configuration template. |
 | `GeminiHover.spec`     | PyInstaller build settings. |
 
