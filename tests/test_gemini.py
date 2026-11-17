@@ -29,6 +29,62 @@ class BuildPartsTest(unittest.TestCase):
         self.assertEqual(parts[1]["inline_data"], {"mime_type": "image/png", "data": "YWJj"})
 
 
+class HistoryTest(unittest.TestCase):
+    def test_contents_include_previous_turns(self):
+        history = []
+        gemini.add_turn(history, "Bonjour", "Salut !")
+        contents = gemini.build_contents("Et toi ?", history=history)
+        self.assertEqual([c["role"] for c in contents], ["user", "model", "user"])
+        self.assertEqual(contents[1]["parts"], [{"text": "Salut !"}])
+        self.assertEqual(contents[2]["parts"], [{"text": "Et toi ?"}])
+
+    def test_no_history(self):
+        self.assertEqual(gemini.build_contents("q"), [{"role": "user", "parts": [{"text": "q"}]}])
+
+
+class ContextTest(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+
+    def write(self, name, data):
+        path = os.path.join(self.dir.name, name)
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
+    def test_text_file(self):
+        part = gemini.file_context_part(self.write("notes.txt", "Leçon 1".encode("utf-8")))
+        self.assertEqual(part, {"text": "[Fichier : notes.txt]\nLeçon 1"})
+
+    def test_cp1252_text_file(self):
+        part = gemini.file_context_part(self.write("vieux.txt", "café".encode("cp1252")))
+        self.assertTrue(part["text"].endswith("café"))
+
+    def test_pdf_is_sent_inline(self):
+        part = gemini.file_context_part(self.write("cours.PDF", b"abc"))
+        self.assertEqual(part["inline_data"], {"mime_type": "application/pdf", "data": "YWJj"})
+
+    def test_binary_file_rejected(self):
+        with self.assertRaises(gemini.GeminiError):
+            gemini.file_context_part(self.write("prog.exe", b"MZ\0\0"))
+
+    def test_missing_file(self):
+        with self.assertRaises(gemini.GeminiError):
+            gemini.file_context_part(os.path.join(self.dir.name, "absent.txt"))
+
+    def test_context_goes_before_question_and_not_in_history(self):
+        history = []
+        gemini.add_turn(history, "Bonjour", "Salut !")
+        contents = gemini.build_contents("Résume", history=history,
+                                         context=[gemini.text_context_part("abc")])
+        last = contents[-1]["parts"]
+        self.assertEqual(last[1], {"text": "[Texte]\nabc"})
+        self.assertEqual(last[-1], {"text": "Résume"})
+        self.assertEqual(contents[0]["parts"], [{"text": "Bonjour"}])
+
+
 class RankModelsTest(unittest.TestCase):
     def m(self, *names):
         return [{"name": "models/" + n, "supportedGenerationMethods": ["generateContent"]} for n in names]
@@ -50,7 +106,7 @@ class FallbackTest(unittest.TestCase):
         import urllib.error
         from unittest import mock
 
-        def fake_generate(q, key, name, timeout, image_png=None):
+        def fake_generate(q, key, name, timeout, image_png=None, history=None, context=None):
             if name == "gemini-3.6-flash":
                 raise urllib.error.HTTPError("u", 503, "busy", {}, io.BytesIO(b"{}"))
             return "ok"
@@ -65,7 +121,7 @@ class TimeoutFallbackTest(unittest.TestCase):
     def test_skips_model_that_times_out(self):
         from unittest import mock
 
-        def fake_generate(q, key, name, timeout, image_png=None):
+        def fake_generate(q, key, name, timeout, image_png=None, history=None, context=None):
             if name == "gemini-3.6-flash":
                 raise TimeoutError("The read operation timed out")
             return "ok"
@@ -82,7 +138,7 @@ class PreferredModelTest(unittest.TestCase):
         from unittest import mock
         tried = []
 
-        def fake_generate(q, key, name, timeout, image_png=None):
+        def fake_generate(q, key, name, timeout, image_png=None, history=None, context=None):
             tried.append(name)
             return "ok"
 

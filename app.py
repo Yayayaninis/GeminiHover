@@ -8,10 +8,10 @@ import threading
 import time
 import tkinter as tk
 from ctypes import wintypes
-from tkinter import simpledialog
+from tkinter import filedialog, simpledialog
 
 import pystray
-from PIL import Image, ImageDraw, ImageGrab
+from PIL import Image, ImageDraw, ImageGrab, ImageStat
 
 import gemini
 
@@ -23,6 +23,8 @@ KEYEVENTF_KEYUP = 0x2
 VK_CONTROL, VK_MENU, VK_SHIFT, VK_C = 0x11, 0x12, 0x10, 0x43
 MAX_LINES = 22
 MAX_IMAGE_SIDE = 2048
+POPUP_ALPHA = 0.5  # opacité de la popup : 1 = opaque, 0 = invisible
+AROUND = 150  # marge (pixels) autour de la popup dont on prend la couleur moyenne
 IMAGE_PROMPT = "Réponds à la question visible sur cette capture d'écran."
 
 user32 = ctypes.windll.user32
@@ -103,15 +105,47 @@ def inside(pt, rect, margin=0):
     return rect[0] - margin <= pt[0] <= rect[2] + margin and rect[1] - margin <= pt[1] <= rect[3] + margin
 
 
-def screen_colors():
-    """(fond, texte, bordure) : couleur majoritaire de l'écran, blanc si la capture échoue."""
+def average_color(img, exclude=None):
+    """Couleur moyenne de toute l'image, en ignorant le rectangle exclude (x0, y0, x1, y1).
+
+    Tous les pixels comptent : une zone surtout sombre avec un peu de couleur donne un fond sombre teinté.
+    """
+    # Réduire l'image (192x108) rend le calcul instantané sans changer la moyenne de façon visible.
+    small = img.convert("RGB").resize((192, 108))
+    # Masque : blanc = pixel pris en compte, noir = pixel ignoré.
+    mask = Image.new("L", small.size, 255)
+    if exclude:
+        sx, sy = small.width / img.width, small.height / img.height  # facteur de réduction
+        x0, y0, x1, y1 = exclude
+        ImageDraw.Draw(mask).rectangle((x0 * sx, y0 * sy, x1 * sx, y1 * sy), fill=0)
+    stat = ImageStat.Stat(small, mask)
+    if not stat.count[0]:  # tout est exclu : aucun pixel à moyenner
+        return 255, 255, 255
+    return tuple(round(v) for v in stat.mean)  # moyenne de chaque canal (rouge, vert, bleu)
+
+
+def screen_colors(area=None, exclude=None):
+    """(fond, texte, bordure) : couleur moyenne d'une zone de l'écran, blanc si la capture échoue.
+
+    area : rectangle écran (coordonnées Tk) à analyser, tout l'écran si None.
+    exclude : rectangle écran (coordonnées Tk) à ignorer, typiquement la popup elle-même.
+    """
     try:
-        img = ImageGrab.grab().convert("RGB").resize((96, 54))
-        # Regroupe les teintes proches pour qu'un dégradé compte comme une seule couleur.
-        quant = img.quantize(colors=8, method=Image.Quantize.MEDIANCUT)
-        palette = quant.getpalette()
-        _, idx = max(quant.getcolors())
-        r, g, b = palette[idx * 3: idx * 3 + 3]
+        shot = ImageGrab.grab()
+        # Les coordonnées Tk peuvent différer des pixels réels si Windows met l'affichage à l'échelle.
+        k = shot.width / user32.GetSystemMetrics(0)
+        ox, oy = 0, 0  # origine de la zone découpée, pour recaler exclude dessus
+        if area:
+            ax0, ay0, ax1, ay1 = (round(v * k) for v in area)
+            # Limite la zone aux bords de l'écran.
+            ax0, ay0 = max(ax0, 0), max(ay0, 0)
+            ax1, ay1 = min(ax1, shot.width), min(ay1, shot.height)
+            shot = shot.crop((ax0, ay0, ax1, ay1))
+            ox, oy = ax0, ay0
+        if exclude:
+            x0, y0, x1, y1 = (v * k for v in exclude)
+            exclude = (x0 - ox, y0 - oy, x1 - ox, y1 - oy)  # coordonnées relatives à la zone
+        r, g, b = average_color(shot, exclude)
     except Exception:
         r, g, b = 255, 255, 255
     dark = 0.299 * r + 0.587 * g + 0.114 * b < 140
@@ -143,6 +177,32 @@ def _open_image(path):
         return None
 
 
+def ask_multiline(parent, title, prompt):
+    """Boîte de dialogue avec une grande zone de texte. Renvoie le texte, ou None si annulé."""
+    win = tk.Toplevel(parent)
+    win.title(title)
+    win.attributes("-topmost", True)  # au premier plan, sinon elle s'ouvre derrière les autres fenêtres
+    tk.Label(win, text=prompt, anchor="w").pack(fill="x", padx=10, pady=(10, 4))
+    box = tk.Text(win, width=70, height=16, wrap="word", font=("Segoe UI", 10))
+    box.pack(fill="both", expand=True, padx=10)
+    result = {"text": None}  # dict : modifiable depuis la fonction interne ok()
+
+    def ok():
+        result["text"] = box.get("1.0", "end").strip() or None
+        win.destroy()
+
+    buttons = tk.Frame(win)
+    buttons.pack(fill="x", padx=10, pady=10)
+    tk.Button(buttons, text="Annuler", width=10, command=win.destroy).pack(side="right")
+    tk.Button(buttons, text="Ajouter", width=10, command=ok).pack(side="right", padx=6)
+    win.bind("<Control-Return>", lambda _e: ok())  # Ctrl+Entrée valide (Entrée seule = nouvelle ligne)
+    win.bind("<Escape>", lambda _e: win.destroy())
+    box.focus_force()
+    win.grab_set()  # bloque les autres fenêtres de l'app tant que la boîte est ouverte
+    parent.wait_window(win)  # attend la fermeture, comme simpledialog
+    return result["text"]
+
+
 def key(vk, up=False):
     user32.keybd_event(vk, 0, KEYEVENTF_KEYUP if up else 0, 0)
 
@@ -170,7 +230,11 @@ class App:
         self.hovering = False
         self.sticky = False  # ouverte par une question ou un clic : reste jusqu'à la croix
         self.model_used = ""
+        self.history = []  # discussion en cours, gardée tant que le programme tourne
         self.popup_body = None
+        # Fichiers / textes joints à chaque question : liste de (nom affiché, part Gemini).
+        # Indépendant de la discussion : « Nouvelle discussion » ne le vide pas.
+        self.context = []
         self.icon = pystray.Icon(
             "gemini-hover",
             make_icon_image(),
@@ -178,8 +242,15 @@ class App:
             menu=pystray.Menu(
                 pystray.MenuItem("Afficher la dernière réponse", lambda: self.events.put(("reopen",)),
                                  default=True),  # aussi déclenché par le clic gauche
+                pystray.MenuItem("Nouvelle discussion", lambda: self.events.put(("new_chat",))),
                 pystray.MenuItem("Poser une question", lambda: self.events.put(("ask",))),
                 pystray.MenuItem("Envoyer le presse-papier", lambda: self.events.put(("clipboard",))),
+                pystray.MenuItem("Contexte", pystray.Menu(
+                    pystray.MenuItem("Ajouter des fichiers…", lambda: self.events.put(("add_files",))),
+                    pystray.MenuItem("Ajouter un texte…", lambda: self.events.put(("add_text",))),
+                    pystray.MenuItem("Voir le contexte", lambda: self.events.put(("show_context",))),
+                    pystray.MenuItem("Vider le contexte", lambda: self.events.put(("clear_context",))),
+                )),
                 pystray.MenuItem("Quitter", lambda: self.events.put(("quit",))),
             ),
         )
@@ -189,6 +260,7 @@ class App:
         p = tk.Toplevel(self.root)
         p.withdraw()
         p.overrideredirect(True)
+        p.attributes("-alpha", POPUP_ALPHA)  # fenêtre semi-transparente
         p.configure(highlightthickness=1)
         header = tk.Frame(p)
         header.pack(fill="x")
@@ -208,8 +280,14 @@ class App:
         self.popup_widgets = (p, header, body, self.popup_title, close, self.popup_body)
         self.popup = p
 
-    def apply_colors(self):
-        bg, fg, border = screen_colors()
+    def apply_colors(self, rect):
+        """Colore la popup avec la couleur moyenne de la zone autour de rect (sa future position)."""
+        x0, y0, x1, y1 = rect
+        area = (x0 - AROUND, y0 - AROUND, x1 + AROUND, y1 + AROUND)
+        # Popup déjà affichée : ses propres pixels ne doivent pas compter. Sinon on garde aussi
+        # ce qui est sous elle, puisque c'est ce qu'on verra à travers la transparence.
+        exclude = self.popup_rect() if self.popup_visible() else None
+        bg, fg, border = screen_colors(area, exclude)
         for w in self.popup_widgets:
             w.configure(bg=bg)
         for w in self.popup_widgets[3:]:
@@ -231,21 +309,29 @@ class App:
             self.popup_scroll.pack(side="right", fill="y")
         else:
             self.popup_scroll.pack_forget()
-        self.popup_title.config(text=f"Gemini · {self.model_used}" if self.model_used else "Gemini")
+        title = "Gemini"
+        if self.model_used:
+            title += f" · {self.model_used}"
+        if self.history:
+            title += f" · {len(self.history) // 2} message(s) dans la discussion"
+        if self.context:
+            title += f" · {len(self.context)} élément(s) en contexte"
+        self.popup_title.config(text=title)
 
     def show_popup(self, sticky=False):
         was_visible = self.popup_visible()
         self.sticky = self.sticky or sticky
-        if not was_visible:
-            self.apply_colors()  # capture avant affichage pour ne pas mesurer la popup elle-même
-        self.refresh_popup()
+        self.refresh_popup()  # d'abord le texte, pour connaître la taille de la fenêtre
         self.popup.update_idletasks()
         w, h = self.popup.winfo_reqwidth(), self.popup.winfo_reqheight()
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         if not was_visible:
             self.anchor_x = cursor_pos()[0]
-        x = min(self.anchor_x - w // 2, sw - w - 8)
-        self.popup.geometry(f"+{max(x, 8)}+{max(sh - h - 56, 8)}")
+        x = max(min(self.anchor_x - w // 2, sw - w - 8), 8)
+        y = max(sh - h - 56, 8)
+        # Puis la couleur, d'après ce qui entoure la position où la popup va s'afficher.
+        self.apply_colors((x, y, x + w, y + h))
+        self.popup.geometry(f"+{x}+{y}")
         self.popup.deiconify()
         # Passe devant une fois, puis redevient une fenêtre normale qu'on peut recouvrir.
         self.popup.attributes("-topmost", True)
@@ -288,11 +374,17 @@ class App:
         self.answer = "Réflexion en cours…"
         self.events.put(("show",))
 
+        # Copie : le contexte peut changer pendant que la requête tourne en arrière-plan.
+        context = [part for _name, part in self.context]
+
         def work():
             try:
-                self.answer, self.model_used = gemini.ask(
+                answer, self.model_used = gemini.ask(
                     text, self.cfg["api_key"], self.cfg["model"], image_png=image_png,
-                    preferred=load_last_model())
+                    preferred=load_last_model(), history=self.history, context=context,
+                    timeout=60 if context else 20)  # un gros PDF demande plus de temps
+                gemini.add_turn(self.history, text, answer, image_png)
+                self.answer = answer
                 save_last_model(self.model_used)
             except gemini.GeminiError as e:
                 self.answer = f"⚠ {e}"
@@ -312,6 +404,43 @@ class App:
         text = text.strip()
         self.query(text or IMAGE_PROMPT, image_png,
                    label=f"[capture d'écran] {text}".strip())
+
+    # --- contexte ----------------------------------------------------------
+    def add_context_files(self):
+        """Ouvre l'explorateur et ajoute les fichiers choisis au contexte."""
+        paths = filedialog.askopenfilenames(
+            parent=self.root, title="Gemini — fichiers de contexte",
+            filetypes=[("Texte, images, PDF", "*.txt *.md *.csv *.json *.py *.html *.pdf *.png *.jpg *.jpeg *.webp"),
+                       ("Tous les fichiers", "*.*")])
+        errors = []
+        for path in paths:  # tuple vide si l'utilisateur annule
+            try:
+                self.context.append((os.path.basename(path), gemini.file_context_part(path)))
+            except gemini.GeminiError as e:
+                errors.append(f"⚠ {e}")  # on continue avec les autres fichiers
+        if paths:
+            self.show_context("\n".join(errors))
+
+    def add_context_text(self):
+        text = ask_multiline(self.root, "Gemini — texte de contexte",
+                             "Colle ou écris le texte à garder en contexte :")
+        if text:
+            first_line = text.splitlines()[0]
+            label = first_line[:40] + ("…" if len(first_line) > 40 or "\n" in text else "")
+            self.context.append((f"Texte « {label} »", gemini.text_context_part(text)))
+            self.show_context()
+
+    def show_context(self, note=""):
+        """Affiche dans la popup la liste des éléments en contexte."""
+        self.question = ""
+        if self.context:
+            lines = "\n".join(f"• {name}" for name, _part in self.context)
+            self.answer = f"Contexte joint à chaque question :\n{lines}"
+        else:
+            self.answer = "Aucun contexte. Ajoute des fichiers ou un texte via le menu Contexte."
+        if note:
+            self.answer += "\n\n" + note
+        self.show_popup(sticky=True)
 
     def clipboard_text(self):
         try:
@@ -346,6 +475,11 @@ class App:
                         self.show_popup()
                 elif kind == "show":
                     self.show_popup(sticky=True)
+                elif kind == "new_chat":
+                    self.history.clear()
+                    self.question = ""
+                    self.answer = "Nouvelle discussion. Sélectionne du texte puis Ctrl+Alt+G."
+                    self.show_popup(sticky=True)
                 elif kind == "reopen":
                     self.show_popup(sticky=True)
                 elif kind == "hotkey":
@@ -369,6 +503,15 @@ class App:
                     text = simpledialog.askstring("Gemini", "Ta question :", parent=self.root)
                     if text and text.strip():
                         self.query(text.strip())
+                elif kind == "add_files":
+                    self.add_context_files()
+                elif kind == "add_text":
+                    self.add_context_text()
+                elif kind == "show_context":
+                    self.show_context()
+                elif kind == "clear_context":
+                    self.context.clear()
+                    self.show_context("Contexte vidé.")
                 elif kind == "error":
                     self.answer = f"⚠ {ev[1]}"
                 elif kind == "quit":
